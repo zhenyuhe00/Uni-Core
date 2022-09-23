@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel
 from unicore.distributed import (
     ModuleProxyWrapper, LegacyDistributedDataParallel
 )
+from unicore.distributed import fsdp_enable_wrap, fsdp_wrap
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,20 @@ def DistributedUnicoreModel(args, model, process_group, device):
         )
         # forward missing getattr and state_dict/load_state_dict to orig model
         wrapped_model = ModuleProxyWrapper(wrapped_model)
+    elif args.ddp_backend == "fully_sharded":
+        try:
+            from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
+        except ImportError:
+            raise ImportError(
+                "Cannot find FullyShardedDataParallel. "
+                "Please install fairscale with: pip install fairscale"
+            )
+        assert isinstance(model, FSDP), "expected model to already be wrapped in FSDP"
+        wrapped_model = model
+        # if args.memory_efficient_fp16:
+        #     wrapped_model = wrapped_model.half()
+        # if not args.cpu_offload:
+        #     wrapped_model = wrapped_model.to(device=device)
     else:
         raise ValueError("Unknown --ddp-backend: " + args.ddp_backend)
 

@@ -25,6 +25,7 @@ from unicore import (
 )
 from unicore.data import iterators
 from unicore.distributed import utils as distributed_utils
+from unicore.distributed import fsdp_enable_wrap, fsdp_wrap
 from unicore.logging import meters, metrics, progress_bar
 from unicore.trainer import Trainer
 from multiprocessing.pool import ThreadPool
@@ -70,7 +71,11 @@ def main(args) -> None:
     assert args.loss, "Please specify loss to train a model"
 
     # Build model and loss
-    model = task.build_model(args)
+    if args.ddp_backend == "fully_sharded":
+        with fsdp_enable_wrap():
+            model = fsdp_wrap(task.build_model(args))
+    else:
+        model = task.build_model(args)
     loss = task.build_loss(args)
 
     # Load valid dataset (we load training data below, based on the latest checkpoint)

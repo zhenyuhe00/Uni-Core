@@ -14,6 +14,8 @@ import os
 import sys
 import time
 from itertools import chain
+import fairscale
+# from fairscale.optim.oss import OSS
 from typing import Any, Dict, List
 
 import torch
@@ -113,12 +115,13 @@ class Trainer(object):
         # copy model and loss to current device/dtype
         self._loss = loss
         self._model = model
-        if args.fp16:
-            self._loss = self._loss.half()
-            self._model = self._model.half()
-        elif args.bf16:
-            self._loss = self._loss.bfloat16()
-            self._model = self._model.bfloat16()
+        if not self.is_fsdp:
+            if args.fp16:
+                self._loss = self._loss.half()
+                self._model = self._model.half()
+            elif args.bf16:
+                self._loss = self._loss.bfloat16()
+                self._model = self._model.bfloat16()
         if (
             # the DistributedUnicoreModel wrapper will handle moving to device,
             # so only handle cases which don't use the wrapper
@@ -183,6 +186,10 @@ class Trainer(object):
         self._optimizer = None
         self._wrapped_loss = None
         self._wrapped_model = None
+        
+    @property
+    def is_fsdp(self):
+        return self.args.ddp_backend == "fully_sharded"
 
     @property
     def data_parallel_world_size(self):
@@ -214,6 +221,14 @@ class Trainer(object):
     def should_save_checkpoint_on_current_rank(self) -> bool:
         """Indicates whether to save checkpoints on the current DDP rank."""
         return self.is_data_parallel_master
+    
+    @property
+    def always_call_state_dict_during_save_checkpoint(self) -> bool:
+        if self.is_fsdp: # and not self.cfg.distributed_training.use_sharded_state:
+            # FSDP calls communication collective when consolidating checkpoints
+            return True
+        else:
+            return False
 
     @property
     def checkpoint_suffix(self) -> str:
@@ -270,14 +285,23 @@ class Trainer(object):
         if self.args.per_sample_clip_norm > 0:
             assert self.args.ddp_backend == "no_c10d"
             assert self.args.batch_size == 1
-        if self.args.fp16 or self.args.bf16:
+            
+        if self.is_fsdp and self.args.fp16:
+            logger.info("MemoryEfficientFP16Optimizer")
+            allow_unsupported = True # not self.cfg.common.memory_efficient_fp16
+            self._optimizer = optim.MemoryEfficientFP16Optimizer.build_optimizer(
+                self.args, params, allow_unsupported=allow_unsupported
+            )
+        
+        elif self.args.fp16 or self.args.bf16:
             if self.cuda and torch.cuda.get_device_capability(0)[0] < 7:
                 logger.info(
                     "NOTE: your device does NOT support faster training with --fp16, "
                     "please switch to FP32 which is likely to be faster"
                 )
             self._optimizer = optim.FP16Optimizer.build_optimizer(self.args, params)
-
+            # logging.info("building OSS optimizer")
+            # self._optimizer = OSS(params=params, optim=self._optimizer)
             if self.args.allreduce_fp32_grad:
                 assert self.args.ddp_backend == "no_c10d"
             if self.args.per_sample_clip_norm > 0:
@@ -286,15 +310,43 @@ class Trainer(object):
             if self.cuda and torch.cuda.get_device_capability(0)[0] >= 7:
                 logger.info("NOTE: your device may support faster training with --fp16")
             self._optimizer = optim.build_optimizer(self.args, params)
+            # logging.info("building OSS optimizer")
+            # self._optimizer = OSS(params=params, optim=self._optimizer)
 
         # We should initialize the learning rate scheduler immediately after
         # building the optimizer, so that the initial learning rate is set.
+        
+        if self.args.zero_sharding == "os":
+            if (
+                self.args.fp16
+            ) and not self.args.fp16_no_flatten_grads:
+                raise ValueError(
+                    "ZeRO is incomptabile with fp16 and flattened grads. "
+                    "Please use --fp16-no-flatten-grads"
+                )
+            else:
+                logger.info("using Optimizer state sharding (ZeRO)")
+                optim.shard_(self._optimizer, self.data_parallel_process_group)
+        
         self._lr_scheduler = lr_scheduler.build_lr_scheduler(
             self.args,
             self.optimizer,
             self._total_train_steps,
         )
         self._lr_scheduler.step_update(0)
+        
+    def consolidate_optimizer(self):
+        """For OSS, we need to consolidate the state dict."""
+        # if self.cfg.checkpoint.no_save_optimizer_state:
+        #     return
+        self._gathered_optim_state = None
+        if hasattr(self.optimizer.optimizer, "consolidate_state_dict"):
+            self.optimizer.optimizer.consolidate_state_dict()
+        elif self.is_fsdp: # and not self.model.use_sharded_state:
+            st = self.model.gather_full_optim_state_dict(
+                self.optimizer
+            )  # only returns on rank 0
+            self._gathered_optim_state = st
 
     def state_dict(self):
         state_dict = {
@@ -319,9 +371,16 @@ class Trainer(object):
             },
         }
         if not self.args.no_save_optimizer_state:
-            state_dict["last_optimizer_state"] = self.optimizer.state_dict()
+            if self._gathered_optim_state is not None:
+                state_dict["last_optimizer_state"] = self._gathered_optim_state
+                self._gathered_optim_state = None
+            else:
+                state_dict["last_optimizer_state"] = self.optimizer.state_dict()
         if self.ema is not None:
             state_dict["ema"] = self.ema.state_dict()
+        if self.is_fsdp:
+            # save meta data for recombining checkpoint upon loading
+            state_dict["fsdp_metadata"] = self.model.local_metadata_dict()
         return state_dict
 
     def save_checkpoint(self, filename, extra_state):
@@ -367,11 +426,22 @@ class Trainer(object):
             )
 
         if bexists:
-            state = None
             if is_master:
                 state = checkpoint_utils.load_checkpoint_to_cpu(
                     filename,
                 )
+                last_optim_state = state.get("last_optimizer_state", None)
+                if (
+                    self.args.zero_sharding == "os"
+                    and "last_optimizer_state" in state
+                    and is_distributed
+                ):
+                    state["last_optimizer_state"] = "SHARDED"
+            else:
+                last_optim_state = None
+                state = None
+                
+                
             if is_distributed:
                 logger.info("Broadcast checkpoint from rank_0")
                 state = distributed_utils.broadcast_object(
@@ -600,6 +670,11 @@ class Trainer(object):
                     self.data_parallel_world_size > 1
                     and hasattr(self.model, "no_sync")
                     and i < len(samples) - 1
+                    # The no_sync context manager results in increased memory
+                    # usage with FSDP, since full-size gradients will be
+                    # accumulated on each GPU. It's typically a better tradeoff
+                    # to do the extra communication with FSDP.
+                    and not self.is_fsdp
                 ):
                     return self.model.no_sync()
                 else:
@@ -902,7 +977,20 @@ class Trainer(object):
         metrics.log_scalar("num_updates", self._num_updates, weight=0, priority=200)
 
     def clip_grad_norm(self, clip_norm):
-        return self.optimizer.clip_grad_norm(clip_norm)
+        def agg_norm_fn(total_norm):
+            total_norm = total_norm.cuda().float() ** 2
+            total_norm = distributed_utils.all_reduce(
+                total_norm, group=self.data_parallel_process_group
+            )
+            return total_norm**0.5
+
+        should_agg_norm = self.is_fsdp and (
+            self.data_parallel_process_group is not None
+            or torch.distributed.is_initialized()
+        )
+        return self.optimizer.clip_grad_norm(
+            clip_norm, aggregate_norm_fn=agg_norm_fn if should_agg_norm else None
+        )
 
     def cumulative_training_time(self):
         if self._cumulative_training_time is None:

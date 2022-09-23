@@ -12,11 +12,14 @@ from unicore import registry
 from unicore.optim.unicore_optimizer import (  # noqa
     UnicoreOptimizer,
 )
-from unicore.optim.fp16_optimizer import FP16Optimizer
+from unicore.optim.fp16_optimizer import FP16Optimizer, MemoryEfficientFP16Optimizer
+from unicore.optim.shard import shard_
 
 __all__ = [
     "UnicoreOptimizer",
     "FP16Optimizer",
+    "MemoryEfficientFP16Optimizer",
+    "shard_",
 ]
 
 (

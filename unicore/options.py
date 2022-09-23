@@ -272,9 +272,12 @@ def add_distributed_training_args(parser):
                        help='which GPU to use (usually configured automatically)')
     group.add_argument('--distributed-no-spawn', action='store_true',
                        help='do not spawn multiple processes even if multiple GPUs are visible')
-    group.add_argument('--ddp-backend', default='c10d', type=str,
-                       choices=['c10d', 'apex', 'no_c10d'],
+    group.add_argument('--ddp-backend', default='none', type=str,
+                       choices=['c10d', 'apex', 'no_c10d', 'fully_sharded'],
                        help='DistributedDataParallel backend')
+    group.add_argument('--zero-sharding', default='c10d', type=str,
+                       choices=['none', 'os'],
+                       help='ZeRO sharding')
     group.add_argument('--bucket-cap-mb', default=25, type=int, metavar='MB',
                        help='bucket size for reduction')
     group.add_argument('--fix-batches-to-gpus', action='store_true',
